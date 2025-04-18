@@ -6,6 +6,11 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		63A552ED2DB232E30052734D /* WhisperKit in Frameworks */ = {isa = PBXBuildFile; productRef = 63A552EC2DB232E30052734D /* WhisperKit */; };
+		63A552EF2DB232E30052734D /* whisperkit-cli in Frameworks */ = {isa = PBXBuildFile; productRef = 63A552EE2DB232E30052734D /* whisperkit-cli */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		63A552CF2DB231300052734D /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -52,6 +57,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				63A552ED2DB232E30052734D /* WhisperKit in Frameworks */,
+				63A552EF2DB232E30052734D /* whisperkit-cli in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -112,6 +119,8 @@
 			);
 			name = ScriptClip;
 			packageProductDependencies = (
+				63A552EC2DB232E30052734D /* WhisperKit */,
+				63A552EE2DB232E30052734D /* whisperkit-cli */,
 			);
 			productName = ScriptClip;
 			productReference = 63A552BD2DB2312E0052734D /* ScriptClip.app */;
@@ -195,6 +204,9 @@
 			);
 			mainGroup = 63A552B42DB2312E0052734D;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				63A552EB2DB232E30052734D /* XCRemoteSwiftPackageReference "WhisperKit" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 63A552BE2DB2312E0052734D /* Products */;
 			projectDirPath = "";
@@ -549,6 +561,30 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		63A552EB2DB232E30052734D /* XCRemoteSwiftPackageReference "WhisperKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/argmaxinc/WhisperKit.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.9.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		63A552EC2DB232E30052734D /* WhisperKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 63A552EB2DB232E30052734D /* XCRemoteSwiftPackageReference "WhisperKit" */;
+			productName = WhisperKit;
+		};
+		63A552EE2DB232E30052734D /* whisperkit-cli */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 63A552EB2DB232E30052734D /* XCRemoteSwiftPackageReference "WhisperKit" */;
+			productName = "whisperkit-cli";
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 63A552B52DB2312E0052734D /* Project object */;
 }
