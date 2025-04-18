@@ -10,8 +10,8 @@ import Combine // For Timer publisher (export progress)
 struct TranscriptWord: Identifiable, Hashable {
     let id = UUID()
     var text: String // Mutable for editing
-    let start: Float
-    let end: Float
+    var start: Float
+    var end: Float
 }
 
 // Custom error for editing operations
@@ -241,15 +241,17 @@ struct ContentView: View {
             guard let assetToEdit = self.currentEditedAsset ?? selectedVideoURL.map(AVURLAsset.init) else {
                 print("[Delete] No asset available (original URL or edited asset)."); return
             }
+            guard !selectedWordIDs.isEmpty else { return }
+                   guard let assetToEdit = self.currentEditedAsset ?? selectedVideoURL.map(AVURLAsset.init) else { return }
             guard let (startTime, endTime) = getTimeRangeForSelection() else { print("[Delete] Could not get time range."); return }
             let maybeOriginalURL = (assetToEdit is AVURLAsset) ? selectedVideoURL : nil // Needed only if accessing original
 
             let timeRangeToRemove = CMTimeRangeFromTimeToTime(start: CMTime(seconds: Double(startTime), preferredTimescale: 600), end: CMTime(seconds: Double(endTime), preferredTimescale: 600))
-            print("[Delete] Removing range: \(CMTimeRangeShow(timeRangeToRemove)) from \(type(of: assetToEdit))")
-            updateStatus("Processing deletion...")
+                    print("[Delete] Removing range: \(CMTimeRangeShow(timeRangeToRemove))")
+                    updateStatus("Processing deletion...")
 
-            Task.detached(priority: .userInitiated) {
-                var accessStarted = false
+                    Task.detached(priority: .userInitiated) {
+                        var accessStarted = false
                 let originalURL = maybeOriginalURL // Capture for use within Task if needed
 
                 do {
@@ -261,79 +263,111 @@ struct ContentView: View {
                      }
 
                     // --- Create Mutable Composition ---
-                     print("[Delete Task] Preparing composition...")
-                     let composition: AVMutableComposition // Declare the variable
+                    let composition: AVMutableComposition
+                         if let existingComp = assetToEdit as? AVComposition, let mutableComp = existingComp.mutableCopy() as? AVMutableComposition {
+                             print("[Delete Task] Copied existing AVComposition.")
+                             composition = mutableComp
+                         } else if let urlAsset = assetToEdit as? AVURLAsset {
+                             print("[Delete Task] Creating new composition from AVURLAsset...")
+                             composition = AVMutableComposition()
+                             async let vTrack = urlAsset.loadTracks(withMediaType: .video).first
+                             async let aTrack = urlAsset.loadTracks(withMediaType: .audio).first
+                             async let dur = urlAsset.load(.duration)
+                             guard let originalVideoTrack = try await vTrack, let originalAudioTrack = try await aTrack else { throw EditError("Cannot load tracks.") }
+                             let originalDuration = try await dur
+                             let compVid = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
+                             let compAud = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+                             try compVid?.insertTimeRange(CMTimeRange(start: .zero, duration: originalDuration), of: originalVideoTrack, at: .zero)
+                             try compAud?.insertTimeRange(CMTimeRange(start: .zero, duration: originalDuration), of: originalAudioTrack, at: .zero)
+                             print("[Delete Task] Populated new composition.")
+                         } else { throw EditError("Failed to create mutable composition.") }
+                         // --- End Create ---
 
-                     // --- FIX: Check type *before* calling mutableCopy ---
-                     if let existingComposition = assetToEdit as? AVComposition {
-                         print("[Delete Task] Base is AVComposition. Creating mutable copy...")
-                         guard let mutableComp = existingComposition.mutableCopy() as? AVMutableComposition else {
-                             throw EditError("Failed to create mutable copy from AVComposition.")
-                         }
-                         composition = mutableComp
-                     }
-                     else if let urlAsset = assetToEdit as? AVURLAsset {
-                         print("[Delete Task] Base is AVURLAsset. Building new composition...")
-                         composition = AVMutableComposition() // Create new empty one
-                         // Load tracks/duration from original asset and add to new composition
-                         async let videoTrack = urlAsset.loadTracks(withMediaType: .video).first
-                         async let audioTrack = urlAsset.loadTracks(withMediaType: .audio).first
-                         async let duration = urlAsset.load(.duration)
-
-                         guard let originalVideoTrack = try await videoTrack,
-                               let originalAudioTrack = try await audioTrack else {
-                             throw EditError("Cannot load tracks from original file.")
-                         }
-                         let originalDuration = try await duration
-
-                         let compVideoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
-                         let compAudioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
-                         try compVideoTrack?.insertTimeRange(CMTimeRange(start: .zero, duration: originalDuration), of: originalVideoTrack, at: .zero)
-                         try compAudioTrack?.insertTimeRange(CMTimeRange(start: .zero, duration: originalDuration), of: originalAudioTrack, at: .zero)
-                         print("[Delete Task] New composition populated from AVURLAsset.")
-                     }
-                     else {
-                          // This case should ideally not be reachable if baseAsset is determined correctly
-                          throw EditError("Unsupported asset type for editing.")
-                     }
-                     // --- End Create Mutable Composition ---
-
-                    // --- Modify Composition ---
-                     let duration = try await composition.load(.duration)
-                     let editRange = CMTimeRange(start: .zero, duration: duration)
-                     print("[Delete Task] Duration before removal: \(CMTimeGetSeconds(duration))s")
-                     guard CMTimeRangeContainsTimeRange(editRange, otherRange: timeRangeToRemove) else { throw EditError("Time range invalid.") }
-                     composition.removeTimeRange(timeRangeToRemove)
-                     print("[Delete Task] Range removed. New duration: \(CMTimeGetSeconds(composition.duration))s")
-                     guard try await composition.load(.isPlayable) else { throw EditError("Result not playable.") }
-                     print("[Delete Task] Result playable.")
-                     // --- End Modify ---
-
+                    let duration = try await composition.load(.duration)
+                        let editRange = CMTimeRange(start: .zero, duration: duration)
+                        guard CMTimeRangeContainsTimeRange(editRange, otherRange: timeRangeToRemove) else { throw EditError("Time range invalid.") }
+                        composition.removeTimeRange(timeRangeToRemove)
+                        print("[Delete Task] Range removed. New duration: \(CMTimeGetSeconds(composition.duration))s")
+                        guard try await composition.load(.isPlayable) else { throw EditError("Result not playable.") }
+                        print("[Delete Task] Result playable.")
+                        // --- End Modify ---
                     // --- Create Immutable Copy & PlayerItem ---
-                     guard let immutableAsset = composition.copy() as? AVAsset else { throw EditError("Failed copy.") }
-                     print("[Delete Task] Created immutable copy.")
-                     let newPlayerItem = await AVPlayerItem(asset: immutableAsset)
-                     print("[Delete Task] Player item created.")
+                    // --- Create Immutable Copy & PlayerItem ---
+                         guard let immutableAsset = composition.copy() as? AVAsset else { throw EditError("Failed copy.") }
+                         let newPlayerItem = await AVPlayerItem(asset: immutableAsset) // Use await
+                         print("[Delete Task] Player item created.")
 
                     // --- Stop access ---
-                     if accessStarted, let url = originalURL { url.stopAccessingSecurityScopedResource(); print("[Delete Task] Stopped access.") }
+                    if accessStarted, let url = maybeOriginalURL { url.stopAccessingSecurityScopedResource(); print("[Delete Task] Stopped access.") }
 
-                     // --- Update Main Actor ---
-                     // Pass back the immutable asset which is the result of this edit
-                     await updatePlayerAndState(with: newPlayerItem, resultingAsset: immutableAsset)
+                    // --- Update Main Actor ---
+                                   // *** Pass startTime and endTime back ***
+                   await updatePlayerAndState(with: newPlayerItem,
+                      resultingAsset: immutableAsset, // Pass immutable result
+                      deletedStartTime: startTime,
+                      deletedEndTime: endTime)
 
-                } catch { // Catch all errors
-                     print("[Delete Task] Error: \(error)")
-                     if accessStarted, let url = originalURL { url.stopAccessingSecurityScopedResource(); print("[Delete Task] Stopped access after error.") }
-                     let msg = (error as? EditError)?.message ?? error.localizedDescription
-                     await updateStatus("Error editing: \(msg)")
+                      } catch { // Catch all errors
+                           print("[Delete Task] Error: \(error)")
+                           if accessStarted, let url = maybeOriginalURL { url.stopAccessingSecurityScopedResource(); print("[Delete Task] Stopped access after error.") }
+                           let msg = (error as? EditError)?.message ?? error.localizedDescription
+                           await updateStatus("Error editing: \(msg)")
+                      }
+                  } // End Task
+              }
+
+    @MainActor private func updatePlayerAndState(
+        with newItem: AVPlayerItem,
+        resultingAsset: AVAsset,
+        deletedStartTime: Float, // Pass the start time of the deleted range
+        deletedEndTime: Float   // Pass the end time of the deleted range
+    ) { /* ... same as before ... */
+         print("[MainActor Update] Replacing player item..."); player?.pause(); self.currentEditedAsset = resultingAsset; player?.replaceCurrentItem(with: newItem); print("[MainActor Update] Stored updated 'currentEditedAsset'.");
+        
+        // --- Timestamp Adjustment ---
+               let durationRemoved = deletedEndTime - deletedStartTime
+               print("[MainActor Update] Adjusting timestamps by \(durationRemoved)s for words after \(deletedEndTime)s.")
+        
+        // Create a temporary copy to iterate over while modifying the original
+                let originalWords = transcriptWords
+                var wordsToRemove: Set<UUID> = selectedWordIDs // Keep track of IDs to remove later
+
+                transcriptWords = originalWords.compactMap { word -> TranscriptWord? in
+                    // Check if this word is one of the ones being deleted
+                    if wordsToRemove.contains(word.id) {
+                        return nil // Filter out deleted words
+                    }
+
+                    var modifiedWord = word // Create a mutable copy
+
+                    // If the word started *after* the deleted section ended, shift it
+                    if modifiedWord.start >= deletedEndTime {
+                         print("Shifting word '\(modifiedWord.text)' from \(modifiedWord.start) -> \(modifiedWord.start - durationRemoved)")
+                         modifiedWord.start -= durationRemoved
+                         modifiedWord.end -= durationRemoved
+                    }
+                    // Optional: Handle words that *overlap* the deletion range?
+                    // For simplicity, we currently just keep/shift words fully *after* the deletion.
+                    // A more robust implementation might truncate or split overlapping words.
+
+                    return modifiedWord // Keep the (potentially modified) word
                 }
-            } // End Task
-        }
-
-    @MainActor private func updatePlayerAndState(with newItem: AVPlayerItem, resultingAsset: AVAsset) { /* ... same as before ... */
-         print("[MainActor Update] Replacing player item..."); player?.pause(); self.currentEditedAsset = resultingAsset; player?.replaceCurrentItem(with: newItem); print("[MainActor Update] Stored updated 'currentEditedAsset'."); transcriptWords.removeAll { selectedWordIDs.contains($0.id) }; selectedWordIDs = []; selectionAnchorID = nil; print("[MainActor Update] Transcript state updated."); DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { guard let item = self.player?.currentItem else { return }; print("[MainActor Update Post-Delay] Item status: \(item.status.rawValue)"); if item.status == .readyToPlay { self.player?.play(); self.updateStatus("Selection deleted.") } else { self.updateStatus("Error playing edited video: \(item.error?.localizedDescription ?? "?")") } }
-    }
+                // --- End Timestamp Adjustment ---
+        
+        selectedWordIDs = [];
+        selectionAnchorID = nil;
+        print("[MainActor Update] Transcript state updated.");
+        
+        
+        // Playback check after delay
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+              guard let item = player?.currentItem else { return }
+              print("[MainActor Update Post-Delay] Item status: \(item.status.rawValue)")
+              if item.status == .readyToPlay { player?.play(); updateStatus("Selection deleted.") }
+              else { updateStatus("Error playing edited video: \(item.error?.localizedDescription ?? "?")") }
+          }
+      }
+        
     @MainActor private func updateStatus(_ message: String) { self.statusMessage = message }
     private func getTimeRangeForSelection() -> (start: Float, end: Float)? { /* ... same as before ... */ guard !selectedWordIDs.isEmpty else { return nil }; let words = transcriptWords.filter { selectedWordIDs.contains($0.id) }; guard !words.isEmpty else { return nil }; let start = words.min { $0.start < $1.start }?.start ?? 0; let end = words.max { $0.end < $1.end }?.end ?? start; return (start, end) }
 
