@@ -1,221 +1,186 @@
 import SwiftUI
-import AVKit
-import WhisperKit
-import CoreML
-import AppKit // <-- Import AppKit for NSEvent
+import AVKit // Player
+import WhisperKit // Transcription
+import CoreML // ML models
+import AppKit // For NSEvent (Shift key)
 
-// Define a struct to hold word timing info (Matches WhisperKit.WordTiming ideally)
-// If WhisperKit.WordTiming is directly usable and Codable, you might not need this,
-// but having our own struct gives flexibility. Let's assume we need it for now.
+// MARK: - Data Structures
+
 struct TranscriptWord: Identifiable, Hashable {
-    let id = UUID() // Make identifiable for ForEach
-    var text: String // Make text mutable
+    let id = UUID()
+    var text: String // Mutable for editing
     let start: Float
     let end: Float
-    // Add any other relevant data from WhisperKit.WordTiming if needed
 }
 
+// Custom error for editing operations
+struct EditError: Error {
+    let message: String
+    init(_ message: String) { self.message = message }
+}
+
+// MARK: - Main Content View
+
 struct ContentView: View {
-    // --- State variables ---
+
+    // MARK: - State Variables
+
+    // File & Player State
     @State private var selectedVideoURL: URL?
     @State private var player: AVPlayer?
-    // Remove the old transcript string state
-    // @State private var transcript: String = "Transcript will appear here..."
-    @State private var transcriptWords: [TranscriptWord] = [] // <-- New state for structured words
+    @State private var accessedURL: URL? // For security-scoped access
+    // NOTE: Removed currentComposition state to simplify and avoid concurrency issues for now.
+    // Edits are currently NOT cumulative. Each delete operates on the original file.
+
+    // Transcription State
+    @State private var transcriptWords: [TranscriptWord] = []
     @State private var isTranscribing: Bool = false
     @State private var transcriptionProgress: Double = 0.0
-    @State private var showingFileImporter = false
-    @State private var statusMessage: String = "Select a video and click Transcribe."
+    @State private var transcriptionTask: Task<Void, Never>? = nil
+
+    // WhisperKit State
     @State private var whisperPipe: WhisperKit?
     @State private var isWhisperKitInitialized = false
     @State private var whisperKitInitError: String? = nil
-    @State private var transcriptionTask: Task<Void, Never>? = nil
-    @State private var accessedURL: URL? = nil
-    
-    // --- Hold the current composition state ---
-    @State private var currentComposition: AVComposition? = nil // Holds the latest edited state
 
-    // State for text selection and highlighting
-    @State private var selectedWordIDs: Set<UUID> = [] // Store IDs of selected words
-    @State private var selectionAnchorID: UUID? = nil // ID of the first word clicked in a potential range selection
-    
-    // --- State for Inline Editing ---
+    // UI State
+    @State private var showingFileImporter = false
+    @State private var statusMessage: String = "Select a video file."
 
-       @State private var editingWordID: UUID? = nil
+    // Selection State
+    @State private var selectedWordIDs: Set<UUID> = []
+    @State private var selectionAnchorID: UUID? = nil
 
-       @State private var editText: String = ""
+    // Inline Editing State
+    @State private var editingWordID: UUID? = nil
+    @State private var editText: String = ""
+    @FocusState private var focusedWordID: UUID?
 
-       @FocusState private var focusedWordID: UUID? // For managing TextField focus
-    
+    // MARK: - Body
+
     var body: some View {
         HSplitView {
-            // --- Left Side: Video Player and Controls (Keep mostly the same) ---
-            VStack {
-                if let player = player {
-                    VideoPlayer(player: player)
-                        .frame(minHeight: 200)
-                        // No need for onAppear/onDisappear play/pause if managed elsewhere
-                } else {
-                    ZStack {
-                        Rectangle().fill(.black).frame(minHeight: 200)
-                        Text(selectedVideoURL == nil ? "Select a video file" : "Loading video...")
-                            .foregroundColor(.secondary)
-                    }
-                }
-                // --- Controls Bar ---
-                HStack {
-                    Button { showingFileImporter = true } label: { Label("Select Video", systemImage: "video.fill") }
-                    Spacer()
-                    if isTranscribing { /* ... Progress/Cancel ... */
-                         ProgressView(value: transcriptionProgress).frame(width: 100)
-                         Text("\(Int(transcriptionProgress * 100))%")
-                         Button("Cancel", role: .destructive) { cancelTranscription() }
-                    }
-                    // Remove manual Transcribe button if auto-transcribe is reliable
-                    // else { /* ... Transcribe Button ... */ }
-                }
-                .padding([.horizontal, .bottom])
-                
-                // --- Edit Controls ---
-                        HStack {
-                            Button(role: .destructive) {
-                                deleteSelectedWords()
-                            } label: {
-                                Label("Delete Selection", systemImage: "trash")
-                            }
-                            .disabled(selectedWordIDs.isEmpty)
+            // --- Left Panel: Player & Controls ---
+            playerAndControlsView
 
-                            Spacer()
-                        }
-                        .padding(.horizontal)
-                        // --- End Add Edit Controls ---
-                
-                // --- Status Message Area ---
-                Text(statusMessage)
-                    .font(.caption).foregroundColor(.secondary).padding(.horizontal).frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .frame(minWidth: 300)
-
-            // --- Right Side: Transcript View ---
-            VStack(alignment: .leading) {
-                Text("Transcript:")
-                    .font(.headline)
-                    .padding(.top)
-                    .padding(.horizontal)
-
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        if transcriptWords.isEmpty && !isTranscribing && selectedVideoURL != nil {
-                             Text("Transcript will appear here after processing.")
-                                .foregroundColor(.secondary)
-                                .padding()
-                        } else if isTranscribing && transcriptWords.isEmpty {
-                             Text("Transcription in progress...")
-                                .foregroundColor(.secondary)
-                                .padding()
-                        } else {
-                            displayTranscriptWords()
-                        }
-                    }
-                    .padding(.horizontal)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(minWidth: 250, minHeight: 200)
-                .border(Color.gray.opacity(0.5))
-                .padding([.horizontal, .bottom])
-            }
-            .frame(minWidth: 300)
+            // --- Right Panel: Transcript ---
+            transcriptEditorView
         }
         // --- Modifiers ---
-        .fileImporter(
-                   isPresented: $showingFileImporter,
-                   allowedContentTypes: [.movie, .video, .audio],
-                   allowsMultipleSelection: false,
-                   onCompletion: { result in
-                       stopAccessingURL() // Stop accessing previous URL if any
-                       switch result {
-                       case .success(let urls):
-                           guard let url = urls.first else { return }
-                           guard url.startAccessingSecurityScopedResource() else { /* ... error handling ... */ return }
-                           
-                           accessedURL = url // Keep track of the URL we have access to
-                           print("Successfully started accessing security scoped resource for \(url.path)")
-                           
-                           // --- Reset state for new file ---
-                           selectedVideoURL = url
-                           currentComposition = nil // Reset composition on new file load
-                           player = AVPlayer(url: url) // Use the original URL initially
-                           transcriptWords = []
-                           selectedWordIDs = []
-                           selectionAnchorID = nil
-                           statusMessage = "Video loaded. Preparing transcription..."
-                           print("Selected file: \(url.path)")
-                           
-                           // --- Auto-Transcribe ---
-                           if isWhisperKitInitialized && whisperKitInitError == nil {
-                               cancelTranscription()
-                               transcriptionTask = Task {
-                                    print("Auto-transcribing...")
-                                    await performTranscription(url: url)
-                               }
-                           } else { /* ... handle not ready ... */ }
-                           
-                       case .failure(let error):
-                           /* ... existing error handling ... */
-                            print("Error selecting file: \(error.localizedDescription)")
-                            selectedVideoURL = nil; player = nil; transcriptWords = []; statusMessage = "Error loading video: \(error.localizedDescription)"; accessedURL = nil; currentComposition = nil
-                       }
-                   }
-               ) // End of .fileImporter
-
+        .fileImporter(isPresented: $showingFileImporter, allowedContentTypes: [.movie, .video, .audio], allowsMultipleSelection: false, onCompletion: handleFileSelection)
         .navigationTitle("ScriptClip")
         .frame(minWidth: 700, minHeight: 450)
-        .task { await initializeWhisperKit() }
-        .onDisappear { cancelTranscription(); stopAccessingURL(); commitEdit() }
-    } // End of body View
-
-    // --- Helper View Struct for displaying/editing a single word ---
-    struct WordView: View {
-        @Binding var word: TranscriptWord
-        @Binding var selectedWordIDs: Set<UUID>
-        @Binding var editingWordID: UUID?
-        @Binding var editText: String
-        @FocusState.Binding var focusedWordID: UUID?
-
-        let onTap: (TranscriptWord) -> Void
-        let onBeginEdit: (TranscriptWord) -> Void
-        let onCommitEdit: () -> Void
-
-        var body: some View {
-            Group {
-                if editingWordID == word.id {
-                    TextField("Edit", text: $editText)
-                        .textFieldStyle(.plain)
-                        .font(.system(.body))
-                        .padding(.vertical, 1)
-                        .fixedSize()
-                        .focused($focusedWordID, equals: word.id)
-                        .onSubmit(onCommitEdit)
-                        .onDisappear(perform: onCommitEdit)
-                        .onChange(of: focusedWordID) {
-                            if focusedWordID != editingWordID && editingWordID == word.id {
-                                 onCommitEdit()
-                            }
-                        }
-                } else {
-                    Text(word.text)
-                        .padding(.vertical, 1)
-                        .padding(.horizontal, 2)
-                        .background(selectedWordIDs.contains(word.id) ? Color.yellow.opacity(0.5) : Color.clear)
-                        .cornerRadius(3)
-                        .onTapGesture(count: 2) { onBeginEdit(word) } // Corrected call
-                        .onTapGesture(count: 1) { onTap(word) }       // Corrected call
-                }
-            }
+        .task { await initializeWhisperKit() } // Initialize WhisperKit on appear
+        .onDisappear { // Cleanup on view disappear
+            cancelTranscription()
+            stopAccessingURL()
+            commitEdit() // Commit any pending text edit
         }
     }
 
-    // --- Display Transcript Words function ---
+    // MARK: - UI Components
+
+    private var playerAndControlsView: some View {
+        VStack {
+            // Video Player
+            if let player = player {
+                VideoPlayer(player: player)
+                    .frame(minHeight: 200)
+                    // Attempt to address layout warnings
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                videoPlaceholderView
+            }
+
+            // Progress/Cancel Bar (during transcription)
+            transcriptionProgressView
+
+            // Edit Controls Bar
+            editControlsView
+
+            // Status Message
+            Text(statusMessage)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding(.horizontal)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .lineLimit(1)
+        }
+        .frame(minWidth: 300)
+    }
+
+    private var videoPlaceholderView: some View {
+        ZStack {
+            Rectangle().fill(.black).frame(minHeight: 200)
+            Text(selectedVideoURL == nil ? "Select a video file" : "Loading video...")
+                .foregroundColor(.secondary)
+        }
+        // Attempt to address layout warnings
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private var transcriptionProgressView: some View {
+        // Shows Select Video button or Transcription Progress/Cancel
+        HStack {
+            Button { showingFileImporter = true } label: { Label("Select Video", systemImage: "video.fill") }
+            Spacer()
+            if isTranscribing {
+                ProgressView(value: transcriptionProgress).frame(width: 100)
+                Text("\(Int(transcriptionProgress * 100))%")
+                Button("Cancel", role: .destructive) { cancelTranscription() }
+            }
+        }
+        .padding([.horizontal, .bottom])
+        .frame(minHeight: 25) // Keep a minimum height
+    }
+
+    private var editControlsView: some View {
+        HStack {
+            Button(role: .destructive) {
+                deleteSelectedWords()
+            } label: {
+                Label("Delete Selection", systemImage: "trash")
+            }
+             // Disable if no media loaded or nothing selected
+            .disabled(selectedWordIDs.isEmpty || selectedVideoURL == nil)
+
+            Spacer()
+        }
+        .padding(.horizontal)
+        .frame(minHeight: 25) // Keep consistent height
+    }
+
+    private var transcriptEditorView: some View {
+        VStack(alignment: .leading) {
+            Text("Transcript:")
+                .font(.headline)
+                .padding(.top)
+                .padding(.horizontal)
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    if transcriptWords.isEmpty && !isTranscribing && selectedVideoURL != nil {
+                         Text("Transcript will appear here.")
+                            .foregroundColor(.secondary).padding()
+                    } else if isTranscribing && transcriptWords.isEmpty {
+                         Text("Transcription in progress...")
+                            .foregroundColor(.secondary).padding()
+                    } else {
+                        displayTranscriptWords() // The main transcript view builder
+                    }
+                }
+                .padding(.horizontal)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(minWidth: 250, minHeight: 200)
+            .border(Color.gray.opacity(0.5))
+            .padding([.horizontal, .bottom])
+        }
+        .frame(minWidth: 300)
+    }
+
+    // --- Transcript Word Display ---
     @ViewBuilder
     private func displayTranscriptWords() -> some View {
         let lines = groupWordsIntoLines(words: transcriptWords, charactersPerLine: 60)
@@ -224,110 +189,62 @@ struct ContentView: View {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 ForEach(lines[lineIndex]) { wordData in
                     if let wordIndex = transcriptWords.firstIndex(where: { $0.id == wordData.id }) {
-                        WordView(
+                        WordView( // Use the helper struct
                             word: $transcriptWords[wordIndex],
                             selectedWordIDs: $selectedWordIDs,
                             editingWordID: $editingWordID,
                             editText: $editText,
                             focusedWordID: $focusedWordID,
-                            onTap: handleTap,           // Correct label matching WordView init
-                            onBeginEdit: beginEditing,  // Correct label matching WordView init
-                            onCommitEdit: commitEdit    // Correct label matching WordView init
+                            onTap: handleTap,
+                            onBeginEdit: beginEditing,
+                            onCommitEdit: commitEdit
                         )
                     } else { EmptyView() }
                 }
             }
         }
     }
-    
-    // --- Tap Handling Logic ---
-    private func handleTap(on word: TranscriptWord) {
-         if editingWordID != nil { commitEdit() } // Commit edit first
-         guard editingWordID == nil else { return } // Ignore taps while editing
 
-         let shiftPressed = NSEvent.modifierFlags.contains(.shift)
-         if shiftPressed, let anchorId = selectionAnchorID,
-            let anchorIndex = transcriptWords.firstIndex(where: { $0.id == anchorId }),
-            let currentIndex = transcriptWords.firstIndex(where: { $0.id == word.id }) {
-             // Extend selection
-             let startIndex = min(anchorIndex, currentIndex)
-             let endIndex = max(anchorIndex, currentIndex)
-             let newSelection = Set(transcriptWords[startIndex...endIndex].map { $0.id })
-             if selectedWordIDs != newSelection { selectedWordIDs = newSelection }
-         } else {
-             // Select single word
-             if selectedWordIDs != [word.id] { seekPlayer(to: word.start) }
-             else { seekPlayer(to: word.start) } // Re-seek if same word clicked
-             selectedWordIDs = [word.id]
-             selectionAnchorID = word.id // Set anchor
-         }
-    }
-    
-    // --- Editing Functions ---
-    private func beginEditing(word: TranscriptWord) {
-         if editingWordID != nil && editingWordID != word.id { commitEdit() }
-         guard editingWordID != word.id else { return } // Don't re-edit same word
+    // MARK: - File Handling & Security Scope
 
-         print("[beginEditing] Starting edit for word: \(word.text) (ID: \(word.id))")
-         editText = word.text
-         editingWordID = word.id
-         selectedWordIDs = []
-         selectionAnchorID = nil
-         
-         // Delay focus setting slightly
-         DispatchQueue.main.async {
-             self.focusedWordID = word.id
-             print("[beginEditing] Focus requested for ID \(word.id)")
-         }
-    }
+    private func handleFileSelection(_ result: Result<[URL], Error>) {
+        stopAccessingURL() // Stop accessing previous URL if any
+        // currentComposition = nil // Removed state
+        player?.replaceCurrentItem(with: nil) // Clear player
+        player = nil
+        transcriptWords = [] // Clear transcript
+        selectedWordIDs = []
+        selectionAnchorID = nil
 
-    private func commitEdit() {
-        guard let wordIdToCommit = editingWordID else { return } // Exit if not editing
-        print("[commitEdit] Attempting to commit edit for ID \(wordIdToCommit)")
-        
-        guard let wordIndex = transcriptWords.firstIndex(where: { $0.id == wordIdToCommit }) else {
-            print("[commitEdit] Error: Could not find word with ID \(wordIdToCommit). Resetting state.")
-            editingWordID = nil; focusedWordID = nil; editText = ""; return
-        }
-
-        let originalText = transcriptWords[wordIndex].text
-        let newText = editText.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if originalText != newText && !newText.isEmpty {
-            print("[commitEdit] Updating word at index \(wordIndex): '\(originalText)' -> '\(newText)'")
-            transcriptWords[wordIndex].text = newText
-        } else if newText.isEmpty {
-             print("[commitEdit] Edit resulted in empty text. Reverting.")
-        } else { print("[commitEdit] No text change for '\(originalText)'.") }
-        
-        editingWordID = nil // Exit editing mode
-        editText = ""
-        // Don't reset focusedWordID, let system manage focus
-    }
-
-    // --- Helper to group words into lines ---
-    private func groupWordsIntoLines(words: [TranscriptWord], charactersPerLine: Int) -> [[TranscriptWord]] {
-        // ... (Implementation remains the same) ...
-         var lines: [[TranscriptWord]] = []; var currentLine: [TranscriptWord] = []; var currentLineLength = 0
-         for word in words { let wordLength = word.text.count + 1; if currentLine.isEmpty || currentLineLength + wordLength <= charactersPerLine { currentLine.append(word); currentLineLength += wordLength } else { lines.append(currentLine); currentLine = [word]; currentLineLength = wordLength } }; if !currentLine.isEmpty { lines.append(currentLine) }; return lines
-    }
-
-    // --- Helper function to seek player ---
-    private func seekPlayer(to time: Float) {
-        guard let player = player else { return }
-        let cmTime = CMTime(seconds: Double(time), preferredTimescale: 600)
-        // Seek and only play if the player wasn't already playing near that time
-        let rate = player.rate
-        player.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak player] finished in
-            guard finished, let player = player else { print("Seek cancelled or interrupted."); return }
-            print("Seek finished to \(time)s")
-            if rate == 0 { // Only play if it was paused
-                player.play()
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            guard url.startAccessingSecurityScopedResource() else {
+                statusMessage = "Error: Could not get permission to access the file."
+                print("Error: Failed to start accessing security scoped resource for \(url.path)")
+                selectedVideoURL = nil; accessedURL = nil
+                return
             }
+
+            accessedURL = url
+            selectedVideoURL = url // Set the URL state AFTER getting access
+            print("Successfully started accessing: \(url.path)")
+
+            // Initialize player with the original asset URL
+            player = AVPlayer(url: url)
+            statusMessage = "Video loaded. Preparing transcription..."
+            print("Selected file: \(url.path)")
+
+            // Trigger auto-transcription
+            triggerAutoTranscription(url: url)
+
+        case .failure(let error):
+            print("Error selecting file: \(error.localizedDescription)")
+            statusMessage = "Error loading video: \(error.localizedDescription)"
+            selectedVideoURL = nil; accessedURL = nil
         }
     }
 
-    // --- Helper function to stop accessing URL ---
     private func stopAccessingURL() {
         if let url = accessedURL {
             url.stopAccessingSecurityScopedResource()
@@ -336,202 +253,423 @@ struct ContentView: View {
         }
     }
 
-    // --- Initialize WhisperKit ---
-    func initializeWhisperKit() async { /* ... implementation ... */
-         guard whisperPipe == nil && whisperKitInitError == nil else { return }
-         await MainActor.run { statusMessage = "Initializing transcription engine..." }; print("Initializing WhisperKit...")
-         do { let pipe = try await WhisperKit(model: "base.en", verbose: true, logLevel: .debug); await MainActor.run { self.whisperPipe = pipe; self.isWhisperKitInitialized = true; self.statusMessage = "Transcription engine ready."; print("WhisperKit initialized successfully.") }
-         } catch { print("Error initializing WhisperKit: \(error)"); await MainActor.run { self.whisperKitInitError = "Failed... \(error.localizedDescription)"; self.statusMessage = self.whisperKitInitError!; self.isWhisperKitInitialized = false } }
+    // MARK: - Transcription Logic
+
+    private func triggerAutoTranscription(url: URL) {
+         if isWhisperKitInitialized && whisperKitInitError == nil {
+            cancelTranscription() // Cancel any previous task
+            transcriptionTask = Task {
+                 print("Auto-transcribing...")
+                 await performTranscription(url: url)
+            }
+         } else {
+             statusMessage = "Video loaded. Initialize engine to transcribe."
+             print("WhisperKit not ready, skipping auto-transcription.")
+         }
     }
 
-    // --- Cancel Transcription ---
-     func cancelTranscription() { /* ... implementation ... */
-          print("Cancellation requested."); transcriptionTask?.cancel(); Task { await MainActor.run { if isTranscribing { statusMessage = "Cancellation requested..." } } }
-     }
+    func initializeWhisperKit() async {
+         guard whisperPipe == nil && whisperKitInitError == nil else { return }
+         await MainActor.run { statusMessage = "Initializing transcription engine..." }
+         print("Initializing WhisperKit...")
+         do {
+             let pipe = try await WhisperKit(model: "base.en", verbose: true, logLevel: .debug)
+             await MainActor.run {
+                 self.whisperPipe = pipe; self.isWhisperKitInitialized = true
+                 self.statusMessage = "Transcription engine ready."
+                 print("WhisperKit initialized successfully.")
+             }
+         } catch {
+             print("Error initializing WhisperKit: \(error)")
+             await MainActor.run {
+                 self.whisperKitInitError = "Failed to init engine: \(error.localizedDescription)"
+                 self.statusMessage = self.whisperKitInitError!
+                 self.isWhisperKitInitialized = false
+             }
+         }
+    }
 
-    // --- Perform Transcription ---
+    func cancelTranscription() {
+         print("Cancellation requested.")
+         transcriptionTask?.cancel() // Request Task cancellation
+         if isTranscribing {
+             // If actively transcribing when cancelled, update state immediately
+             Task { await MainActor.run { cleanupAfterTranscription(status: "Transcription cancelled.") } }
+         }
+    }
+
     @MainActor
-    func performTranscription(url: URL) async { /* ... implementation ... */
-         guard isWhisperKitInitialized, let activeWhisperPipe = whisperPipe else { return }
-         guard transcriptionTask != nil && !transcriptionTask!.isCancelled && !isTranscribing else { return }
-         print("Starting transcription for: \(url.path)"); isTranscribing = true; transcriptionProgress = 0.0; transcriptWords = []; statusMessage = "Starting transcription: Extracting audio..."
+    func performTranscription(url: URL) async {
+         guard isWhisperKitInitialized, let activeWhisperPipe = whisperPipe else {
+              statusMessage = "Transcription engine not ready."
+              print("Attempted transcription but WhisperKit not ready.")
+              isTranscribing = false // Ensure this is reset
+              return
+         }
+         guard !isTranscribing else {
+              print("Transcription already in progress, ignoring duplicate request.")
+              return
+         }
+
+         print("Starting transcription process for: \(url.path)")
+         isTranscribing = true // Set flag immediately
+         transcriptionProgress = 0.0
+         transcriptWords = [] // Clear previous results
+         statusMessage = "Extracting audio..."
+
+         // --- Audio Extraction ---
+         guard let audioFrames = await extractAndConvertAudio(from: url, isCancelled: { Task.isCancelled }) else {
+             if Task.isCancelled { print("Audio extraction cancelled."); cleanupAfterTranscription(status: "Transcription cancelled.") }
+             else { print("Audio extraction failed."); cleanupAfterTranscription(status: "Error: Failed to extract audio.") }
+             return
+         }
+         // Silence 'unused' warning
+         _ = audioFrames.count
+
+         // --- Check for Cancellation After Extraction ---
          if Task.isCancelled { cleanupAfterTranscription(status: "Transcription cancelled."); return }
-         guard let audioFrames = await extractAndConvertAudio(from: url, isCancelled: { Task.isCancelled }) else { if Task.isCancelled { cleanupAfterTranscription(status: "Audio extraction cancelled.") } else { cleanupAfterTranscription(status: "Error: Failed to extract audio.") }; return }
-         if Task.isCancelled { cleanupAfterTranscription(status: "Transcription cancelled."); return }
+
+         // --- Transcription ---
          statusMessage = "Transcribing audio..."
-         do { print("Passing \(audioFrames.count) audio frames to WhisperKit."); let decodingOptions = DecodingOptions(verbose: true, wordTimestamps: true ); let transcriptionCallback: TranscriptionCallback = { progress in Task { @MainActor in guard self.isTranscribing else { return }; self.transcriptionProgress += 0.01; if self.transcriptionProgress > 1.0 { self.transcriptionProgress = 1.0 }; self.statusMessage = "Transcribing... \(Int(self.transcriptionProgress * 100))%" }; return !Task.isCancelled }; let transcriptionResults: [TranscriptionResult] = try await activeWhisperPipe.transcribe(audioArray: audioFrames, decodeOptions: decodingOptions, callback: transcriptionCallback ); if Task.isCancelled { cleanupAfterTranscription(status: "Transcription cancelled."); return }; let mergedResult = mergeTranscriptionResults(transcriptionResults); if let finalWords = mergedResult?.allWords { self.transcriptWords = finalWords.map { TranscriptWord(text: $0.word, start: $0.start, end: $0.end) }; print("Transcription finished with \(self.transcriptWords.count) words."); self.statusMessage = "Transcription complete." } else { print("Transcription finished but produced no words/text."); self.transcriptWords = []; self.statusMessage = "Transcription complete (no text)." }; self.transcriptionProgress = 1.0; cleanupAfterTranscription(status: self.statusMessage)
-         } catch is CancellationError { cleanupAfterTranscription(status: "Transcription cancelled.") }
+         do {
+             print("Passing \(audioFrames.count) audio frames to WhisperKit.")
+             let decodingOptions = DecodingOptions(verbose: true, wordTimestamps: true)
+             let transcriptionCallback: TranscriptionCallback = { progress in Task { @MainActor in guard self.isTranscribing else { return }; let currentProgress = self.transcriptionProgress + 0.01; self.transcriptionProgress = min(currentProgress, 0.95); self.statusMessage = "Transcribing... \(Int(self.transcriptionProgress * 100))%" }; return !Task.isCancelled }
+
+             let transcriptionResults: [TranscriptionResult] = try await activeWhisperPipe.transcribe( audioArray: audioFrames, decodeOptions: decodingOptions, callback: transcriptionCallback )
+             if Task.isCancelled { cleanupAfterTranscription(status: "Transcription cancelled."); return }
+
+             // --- Process Results ---
+             let mergedResult = mergeTranscriptionResults(transcriptionResults)
+             if let finalWords = mergedResult?.allWords { self.transcriptWords = finalWords.map { TranscriptWord(text: $0.word, start: $0.start, end: $0.end) }; print("Transcription finished with \(self.transcriptWords.count) words."); cleanupAfterTranscription(status: "Transcription complete.") }
+             else { print("Transcription finished but produced no words/text."); self.transcriptWords = []; cleanupAfterTranscription(status: "Transcription complete (no text).") }
+             self.transcriptionProgress = 1.0 // Ensure progress hits 100%
+
+         } catch is CancellationError { print("Transcription task explicitly cancelled."); cleanupAfterTranscription(status: "Transcription cancelled.") }
            catch { print("WhisperKit transcription failed: \(error)"); cleanupAfterTranscription(status: "Error during transcription."); self.transcriptWords = [] }
     }
 
-    // --- Cleanup After Transcription ---
     @MainActor
-    private func cleanupAfterTranscription(status: String) { /* ... implementation ... */
-         print("Cleaning up transcription task. Final Status: \(status)"); isTranscribing = false; statusMessage = status; if status != "Transcription complete." && !status.contains("no text") { transcriptionProgress = 0.0 } else { transcriptionProgress = 1.0 }; transcriptionTask = nil
+    private func cleanupAfterTranscription(status: String) {
+         print("Cleaning up transcription task. Final Status: \(status)")
+         if status == "Transcription complete." || status.contains("no text") { transcriptionProgress = 1.0 }
+         else { transcriptionProgress = 0.0 } // Failed or cancelled
+         isTranscribing = false
+         statusMessage = status
+         transcriptionTask = nil
     }
 
-    // --- AVFoundation Audio Extraction Function ---
-     func extractAndConvertAudio(from url: URL, isCancelled: @escaping () -> Bool) async -> [Float]? { /* ... implementation ... */
-         print("Starting audio extraction for: \(url.path)"); let asset = AVURLAsset(url: url); let isPlayable = try? await asset.load(.isPlayable); let hasProtectedContent = try? await asset.load(.hasProtectedContent); print("Asset properties: isPlayable=\(isPlayable ?? false), hasProtectedContent=\(hasProtectedContent ?? false)"); if hasProtectedContent == true { print("Error: Asset has protected content."); return nil }; guard let assetTrack = try? await asset.loadTracks(withMediaType: .audio).first else { print("Error: Could not load audio track from asset."); do { _ = try await asset.loadTracks(withMediaType: .audio); print("Debug: Loaded tracks successfully, but couldn't get first?") } catch { print("Error loading tracks: \(error)") }; return nil }; let duration = try? await asset.load(.duration); let totalSeconds = duration?.seconds ?? 0; print("Track duration: \(totalSeconds) seconds"); guard let reader = try? AVAssetReader(asset: asset) else { return nil }; let outputSettings: [String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000.0, AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true, AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false]; let trackOutput = AVAssetReaderTrackOutput(track: assetTrack, outputSettings: outputSettings); guard reader.canAdd(trackOutput) else { return nil }; reader.add(trackOutput); guard reader.startReading() else { return nil }; print("AVAssetReader started reading..."); var audioFrames: [Float] = []; var bufferCount = 0; let bufferReadQueue = DispatchQueue(label: "audio-buffer-read-queue"); return await Task { var frames: [Float]? = []; bufferReadQueue.sync { while reader.status == .reading { if isCancelled() { reader.cancelReading(); frames = nil; break }; if let sampleBuffer = trackOutput.copyNextSampleBuffer() { bufferCount += 1; if let samples = self.convertSampleBuffer(sampleBuffer) { frames?.append(contentsOf: samples) }; CMSampleBufferInvalidate(sampleBuffer) } else { break } } }; if reader.status == .cancelled { return nil } else if reader.status == .failed { return nil } else if reader.status == .completed && frames != nil { print("Extraction complete. Read \(bufferCount) buffers. Total frames: \(frames!.count)"); return frames } else { return nil } }.value
+    // MARK: - AVFoundation Logic
+
+    // --- Audio Extraction ---
+     func extractAndConvertAudio(from url: URL, isCancelled: @escaping () -> Bool) async -> [Float]? {
+         print("[Audio Extraction] Starting for: \(url.path)")
+         let asset = AVURLAsset(url: url)
+         do {
+             // Check properties concurrently
+             async let isPlayable = try asset.load(.isPlayable)
+             async let hasProtectedContent = try asset.load(.hasProtectedContent)
+             async let tracks = try asset.loadTracks(withMediaType: .audio)
+             async let duration = try asset.load(.duration)
+
+             let playable = try await isPlayable
+             let protected = try await hasProtectedContent
+             print("[Audio Extraction] Properties: isPlayable=\(playable), hasProtectedContent=\(protected)")
+             if protected { throw EditError("Asset has protected content.") }
+             if !playable { throw EditError("Asset is not playable.") }
+
+             guard let assetTrack = try await tracks.first else { throw EditError("No audio track found.") }
+             print("[Audio Extraction] Track duration: \(try await duration.seconds) seconds")
+
+             // Setup reader
+             guard let reader = try? AVAssetReader(asset: asset) else { throw EditError("Error creating AVAssetReader.") }
+             let outputSettings: [String: Any] = [ AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000.0, AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true, AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false ]
+             let trackOutput = AVAssetReaderTrackOutput(track: assetTrack, outputSettings: outputSettings)
+             guard reader.canAdd(trackOutput) else { throw EditError("Cannot add track output.") }
+             reader.add(trackOutput)
+
+             guard reader.startReading() else { throw EditError("Error starting reader: \(reader.error?.localizedDescription ?? "Unknown")") }
+             print("[Audio Extraction] AVAssetReader started reading...")
+
+             // Read samples in background Task
+             return try await Task.detached(priority: .userInitiated) {
+                 var audioFrames: [Float] = []
+                 var bufferCount = 0
+                 let bufferReadQueue = DispatchQueue(label: "audio-buffer-read-queue", qos: .userInitiated)
+
+                 var readError: Error? = nil
+                 var cancelled = false
+
+                 bufferReadQueue.sync { // Ensure reading finishes before Task returns
+                     while reader.status == .reading {
+                         if isCancelled() { reader.cancelReading(); cancelled = true; break }
+                         if let sampleBuffer = trackOutput.copyNextSampleBuffer() {
+                             bufferCount += 1
+                             if let samples = convertSampleBuffer(sampleBuffer) { audioFrames.append(contentsOf: samples) }
+                             else { readError = EditError("Failed to convert sample buffer"); reader.cancelReading(); break }
+                             CMSampleBufferInvalidate(sampleBuffer)
+                         } else { break } // End of stream or error during copy
+                     }
+                     // Capture reader error if reading failed
+                     if reader.status == .failed { readError = reader.error }
+                 } // End sync block
+
+                 // Check final status
+                 if cancelled { throw CancellationError() }
+                 if let error = readError { throw EditError("Reader failed: \(error.localizedDescription)") }
+                 guard reader.status == .completed else { throw EditError("Reader finished with unexpected status: \(reader.status.rawValue)") }
+
+                 print("[Audio Extraction Task] Complete. Read \(bufferCount) buffers. Frames: \(audioFrames.count)")
+                 return audioFrames
+             }.value
+
+         } catch is CancellationError {
+              print("[Audio Extraction] Cancelled during async operations.")
+              return nil
+         } catch {
+              print("[Audio Extraction] Failed: \(error.localizedDescription)")
+              return nil
+         }
      }
 
     // --- Convert Sample Buffer ---
-    private func convertSampleBuffer(_ sampleBuffer: CMSampleBuffer) -> [Float]? { /* ... implementation ... */
-         guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }; let length = CMBlockBufferGetDataLength(blockBuffer); guard length % MemoryLayout<Float>.stride == 0 else { return nil }; let numFloats = length / MemoryLayout<Float>.stride; var data = [Float](repeating: 0.0, count: numFloats); let status = CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: &data); guard status == kCMBlockBufferNoErr else { return nil }; return data
+    private func convertSampleBuffer(_ sampleBuffer: CMSampleBuffer) -> [Float]? {
+         guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
+         let length = CMBlockBufferGetDataLength(blockBuffer)
+         guard length > 0, length % MemoryLayout<Float>.stride == 0 else { return nil } // Added length > 0 check
+         let numFloats = length / MemoryLayout<Float>.stride
+         var data = [Float](repeating: 0.0, count: numFloats)
+         let status = CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: &data)
+         guard status == kCMBlockBufferNoErr else { print("Error copying buffer data: \(status)"); return nil }
+         return data
     }
 
-    // --- Merge Transcription Results ---
-    private func mergeTranscriptionResults(_ results: [TranscriptionResult]) -> TranscriptionResult? { /* ... implementation ... */
-         guard !results.isEmpty else { return nil }; if results.count == 1 { return results.first }; let combinedText = results.map { $0.text }.joined(separator: " "); let combinedSegments = results.flatMap { $0.segments }; let language = results.first!.language; var mergedTimings = results.first!.timings; mergedTimings.fullPipeline = results.reduce(TimeInterval(0)) { $0 + $1.timings.fullPipeline }; return TranscriptionResult(text: combinedText, segments: combinedSegments, language: language, timings: mergedTimings)
-    }
-    
-    // --- Delete Functionality ---
+    // MARK: - Editing Logic
+
     @MainActor
     private func deleteSelectedWords() {
-            guard !selectedWordIDs.isEmpty else { print("[Delete] No words selected."); return }
-            guard let originalURL = selectedVideoURL else { print("[Delete] No original URL."); return }
-            guard let (startTime, endTime) = getTimeRangeForSelection() else { print("[Delete] Could not get time range."); return }
+        guard !selectedWordIDs.isEmpty else { print("[Delete] No words selected."); return }
+        guard let originalURL = selectedVideoURL else { print("[Delete] No original URL."); return }
+        guard let (startTime, endTime) = getTimeRangeForSelection() else { print("[Delete] Could not get time range."); return }
 
-            let timeRangeToRemove = CMTimeRangeFromTimeToTime(start: CMTime(seconds: Double(startTime), preferredTimescale: 600),
-                                                              end: CMTime(seconds: Double(endTime), preferredTimescale: 600))
-            print("[Delete] Attempting to remove time range: \(CMTimeRangeShow(timeRangeToRemove))")
-            statusMessage = "Processing deletion..."
+        let timeRangeToRemove = CMTimeRangeFromTimeToTime(start: CMTime(seconds: Double(startTime), preferredTimescale: 600),
+                                                          end: CMTime(seconds: Double(endTime), preferredTimescale: 600))
+        print("[Delete] Removing range: \(CMTimeRangeShow(timeRangeToRemove)) from ORIGINAL asset.") // Non-cumulative edit
+        statusMessage = "Processing deletion..."
 
-            // --- Determine the asset to edit (allow cumulative edits) ---
-            // Use the currently stored composition if it exists, otherwise use the original URL asset
-            let baseAsset = currentComposition ?? AVURLAsset(url: originalURL)
-            print("[Delete] Base asset for edit duration: \(CMTimeGetSeconds(baseAsset.duration))s")
+        Task.detached(priority: .userInitiated) {
+            var accessStarted = false // Track if access needs to be stopped
+            do {
+                // --- Resource Access ---
+                 guard originalURL.startAccessingSecurityScopedResource() else { throw EditError("Could not re-access file.") }
+                 accessStarted = true
+                 print("[Delete Task] Started access: \(originalURL.path)")
 
-            Task { // Perform composition asynchronously
-                // --- Access Resource within Task if using original URL ---
-                var didStartAccess = false
-                if currentComposition == nil { // Only need to access if using original URL
-                    guard originalURL.startAccessingSecurityScopedResource() else {
-                         await MainActor.run { statusMessage = "Error: Could not re-access file for editing." }
-                         print("[Delete Task] Failed to start access for \(originalURL.path)")
-                         return
-                    }
-                    didStartAccess = true
-                    print("[Delete Task] Started accessing resource: \(originalURL.path)")
-                    defer {
-                        if didStartAccess {
-                            originalURL.stopAccessingSecurityScopedResource()
-                            print("[Delete Task] Stopped accessing resource: \(originalURL.path)")
-                        }
-                    }
+                // --- Always create composition from the ORIGINAL URL Asset ---
+                 let originalAsset = AVURLAsset(url: originalURL)
+                 let composition = AVMutableComposition()
+
+                 // --- Populate NEW composition from original ---
+                 print("[Delete Task] Creating new composition from AVURLAsset...")
+                 async let videoTrack = originalAsset.loadTracks(withMediaType: .video).first
+                 async let audioTrack = originalAsset.loadTracks(withMediaType: .audio).first
+                 async let duration = originalAsset.load(.duration)
+
+                 guard let originalVideoTrack = try await videoTrack,
+                       let originalAudioTrack = try await audioTrack else { throw EditError("Cannot load tracks.") }
+                 let originalDuration = try await duration
+
+                 let compVideoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
+                 let compAudioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+                 try compVideoTrack?.insertTimeRange(CMTimeRange(start: .zero, duration: originalDuration), of: originalVideoTrack, at: .zero)
+                 try compAudioTrack?.insertTimeRange(CMTimeRange(start: .zero, duration: originalDuration), of: originalAudioTrack, at: .zero)
+                 print("[Delete Task] Tracks added.")
+                 // --- End Populate ---
+
+                // --- Modify Composition ---
+                 let editAssetDuration = try await composition.load(.duration) // Await duration load
+                 let editAssetTimeRange = CMTimeRange(start: .zero, duration: editAssetDuration)
+                 print("[Delete Task] Duration before removal: \(CMTimeGetSeconds(editAssetDuration))s")
+
+                 guard CMTimeRangeContainsTimeRange(editAssetTimeRange, otherRange: timeRangeToRemove) else { throw EditError("Selected time range invalid.") }
+
+                 composition.removeTimeRange(timeRangeToRemove)
+                 print("[Delete Task] Time range removed. New duration: \(CMTimeGetSeconds(composition.duration))s")
+
+                 guard try await composition.load(.isPlayable) else { throw EditError("Edited composition not playable.") } // Await playability
+                 print("[Delete Task] Edited composition playable.")
+                 // --- End Modify ---
+
+                // --- Create PlayerItem ---
+                guard let immutableAsset = composition.copy() as? AVAsset else {
+                     throw EditError("Failed to create immutable copy of composition.")
                 }
+                
+                print("[Delete Task] Created immutable copy for PlayerItem.")
+                
+                // Create player item from the IMMUTABLE copy, using await
 
-                // --- Create Mutable Composition Correctly ---
-                let composition: AVMutableComposition
+                let newPlayerItem = await AVPlayerItem(asset: immutableAsset)
+                print("[Delete Task] New player item created.")
 
-                // If the baseAsset is already a composition, make a mutable copy
-                if let existingComposition = baseAsset as? AVComposition {
-                     print("[Delete Task] Base asset is AVComposition, creating mutable copy...")
-                     guard let mutableComp = existingComposition.mutableCopy() as? AVMutableComposition else {
-                          print("[Delete Task] Failed to create mutable copy from existing AVComposition.")
-                          await MainActor.run { statusMessage = "Error preparing video for editing (copy failed)." }
-                          return
-                     }
-                     composition = mutableComp
-                }
-                // If the baseAsset is the original AVURLAsset, create a *new* mutable composition
-                // and add the tracks from the original asset.
-                else if let urlAsset = baseAsset as? AVURLAsset {
-                     print("[Delete Task] Base asset is AVURLAsset, creating new AVMutableComposition...")
-                     composition = AVMutableComposition()
-                     do {
-                          // Load tracks from the original URL asset
-                          guard let originalVideoTrack = try await urlAsset.loadTracks(withMediaType: .video).first,
-                                let originalAudioTrack = try await urlAsset.loadTracks(withMediaType: .audio).first else {
-                               throw EditError("Cannot load tracks from original AVURLAsset.")
-                          }
-                          let originalDuration = try await urlAsset.load(.duration)
+                // --- Stop access before returning to MainActor ---
+                 if accessStarted { originalURL.stopAccessingSecurityScopedResource(); print("[Delete Task] Stopped access.") }
+                 accessStarted = false // Mark as stopped
 
-                          // Add tracks to the new composition
-                          let compositionVideoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
-                          let compositionAudioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+                 // --- Update Main Actor State ---
+                 await MainActor.run {
+                      print("[Delete MainActor] Replacing player item...")
+                      player?.pause()
+                      // currentComposition = nil // Removed state
+                      player?.replaceCurrentItem(with: newPlayerItem) // Replace with the new item
 
-                          try compositionVideoTrack?.insertTimeRange(CMTimeRange(start: .zero, duration: originalDuration), of: originalVideoTrack, at: .zero)
-                          try compositionAudioTrack?.insertTimeRange(CMTimeRange(start: .zero, duration: originalDuration), of: originalAudioTrack, at: .zero)
-                          print("[Delete Task] Tracks from original AVURLAsset added to new composition.")
-                     } catch {
-                          print("[Delete Task] Failed to load tracks or duration from original AVURLAsset: \(error)")
-                          await MainActor.run { statusMessage = "Error preparing video for editing (track loading failed)." }
-                          return
-                     }
-                }
-                // Should not happen, but handle unexpected asset types
-                else {
-                      print("[Delete Task] Error: Base asset is of unexpected type.")
-                      await MainActor.run { statusMessage = "Error: Unexpected video format for editing." }
-                      return
-                }
-                // --- End Create Mutable Composition ---
+                      // Update Transcript & Selection
+                      transcriptWords.removeAll { selectedWordIDs.contains($0.id) }
+                      selectedWordIDs = []; selectionAnchorID = nil
+                      print("[Delete MainActor] Transcript state updated.")
 
+                      // Playback logic
+                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                           guard let currentItem = self.player?.currentItem else { return }
+                           print("[Delete MainActor Post-Delay] Item status: \(currentItem.status.rawValue)")
+                           if currentItem.status == .readyToPlay { self.player?.play(); self.statusMessage = "Selection deleted." }
+                           else if currentItem.status == .failed { self.statusMessage = "Error playing edited video: \(currentItem.error?.localizedDescription ?? "unknown")" }
+                           else { self.statusMessage = "Edited video loaded..." }
+                      }
+                 } // End MainActor.run
 
-                // --- Now modify the 'composition' (which is guaranteed to be mutable) ---
-                do {
-                    let editAssetDuration = try await composition.load(.duration) // Load from the mutable comp
-                    let editAssetTimeRange = CMTimeRange(start: .zero, duration: editAssetDuration)
-                    print("[Delete Task] Mutable composition duration before removal: \(CMTimeGetSeconds(editAssetDuration))s")
-
-                    guard CMTimeRangeContainsTimeRange(editAssetTimeRange, otherRange: timeRangeToRemove) else {
-                        print("[Delete Task] Error: Time range invalid for asset duration.")
-                        throw EditError("Selected time range is invalid.")
-                    }
-
-                    composition.removeTimeRange(timeRangeToRemove)
-                    print("[Delete Task] Time range removed. New duration: \(CMTimeGetSeconds(composition.duration))s")
-
-                    guard try await composition.load(.isPlayable) else { throw EditError("Edited composition not playable.") }
-                    print("[Delete Task] Edited composition playable.")
-
-                    let newPlayerItem = AVPlayerItem(asset: composition) // Create item from the modified composition
-                    print("[Delete Task] New player item created.")
-
-                    await MainActor.run {
-                         print("[Delete MainActor] Replacing player item...")
-                         player?.pause()
-                         player?.replaceCurrentItem(with: newPlayerItem)
-                         self.currentComposition = composition // *** Store the latest valid composition state ***
-
-                         // Update Transcript & Selection State
-                         transcriptWords.removeAll { selectedWordIDs.contains($0.id) }
-                         selectedWordIDs = []
-                         selectionAnchorID = nil
-                         print("[Delete MainActor] Transcript state updated.")
-
-                        // Check status & play after delay
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            guard let currentItem = self.player?.currentItem else { return }
-                            print("[Delete MainActor Post-Delay] New item status: \(currentItem.status.rawValue)")
-                            if currentItem.status == .readyToPlay { self.player?.play(); self.statusMessage = "Selection deleted." }
-                            else if currentItem.status == .failed { self.statusMessage = "Error playing edited video: \(currentItem.error?.localizedDescription ?? "unknown")" }
-                            else { self.statusMessage = "Edited video loaded..." }
-                        }
-                    } // End MainActor.run
-
-                } catch {
-                     print("[Delete Task] Error during AVComposition editing: \(error)")
-                     let errorMessage = (error as? EditError)?.message ?? error.localizedDescription
-                     await MainActor.run { statusMessage = "Error during editing: \(errorMessage)" }
-                }
-            } // End Task
-        }
-
-    // Helper struct for custom errors during editing
-    struct EditError: Error {
-        let message: String
-        init(_ message: String) { self.message = message }
+            } catch { // Catch errors from async/await or thrown EditErrors
+                 print("[Delete Task] Error during AVComposition editing/loading: \(error)")
+                 // Ensure access is stopped even on error
+                 if accessStarted { originalURL.stopAccessingSecurityScopedResource(); print("[Delete Task] Stopped access after error.") }
+                 let errorMessage = (error as? EditError)?.message ?? error.localizedDescription
+                 await MainActor.run { statusMessage = "Error during editing: \(errorMessage)" }
+            }
+        } // End Task
     }
 
-    // --- Get Time Range For Selection ---
     private func getTimeRangeForSelection() -> (start: Float, end: Float)? {
-        // ... (Implementation remains the same) ...
-         guard !selectedWordIDs.isEmpty else { return nil }; let selectedWords = transcriptWords.filter { selectedWordIDs.contains($0.id) }; guard !selectedWords.isEmpty else { return nil }; let startTime = selectedWords.min(by: { $0.start < $1.start })?.start ?? 0.0; let endTime = selectedWords.max(by: { $0.end < $1.end })?.end ?? startTime; return (startTime, endTime)
+         guard !selectedWordIDs.isEmpty else { return nil }
+         let selectedWords = transcriptWords.filter { selectedWordIDs.contains($0.id) }
+         guard !selectedWords.isEmpty else { return nil }
+         let startTime = selectedWords.min(by: { $0.start < $1.start })?.start ?? 0.0
+         let endTime = selectedWords.max(by: { $0.end < $1.end })?.end ?? startTime
+         return (startTime, endTime)
     }
-} //End ContentView
 
+    // MARK: - Text Editing & Selection
+
+    // --- ADD THIS FUNCTION BACK ---
+    private func seekPlayer(to time: Float) {
+        guard let player = player else { return }
+        let cmTime = CMTime(seconds: Double(time), preferredTimescale: 600)
+        let rate = player.rate // Get rate before seeking
+        player.seek(to: cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { [weak player] finished in
+            guard finished, let player = player else { print("Seek cancelled."); return }
+            print("Seek finished to \(time)s")
+            if rate == 0 { player.play() } // Play only if was paused
+        }
+    }
+
+    private func handleTap(on word: TranscriptWord) {
+         if editingWordID != nil { commitEdit() }
+         guard editingWordID == nil else { return }
+
+         let shiftPressed = NSEvent.modifierFlags.contains(.shift)
+         if shiftPressed, let anchorId = selectionAnchorID,
+            let anchorIndex = transcriptWords.firstIndex(where: { $0.id == anchorId }),
+            let currentIndex = transcriptWords.firstIndex(where: { $0.id == word.id }) {
+             let startIndex = min(anchorIndex, currentIndex); let endIndex = max(anchorIndex, currentIndex)
+             let newSelection = Set(transcriptWords[startIndex...endIndex].map { $0.id })
+             if selectedWordIDs != newSelection { selectedWordIDs = newSelection }
+         } else {
+             if selectedWordIDs != [word.id] { seekPlayer(to: word.start) } else { seekPlayer(to: word.start) }
+             selectedWordIDs = [word.id]
+             selectionAnchorID = word.id
+         }
+    }
+
+    private func beginEditing(word: TranscriptWord) {
+         if editingWordID != nil && editingWordID != word.id { commitEdit() }
+         guard editingWordID != word.id else { return }
+
+         print("[beginEditing] Word: \(word.text) (ID: \(word.id))")
+         editText = word.text; editingWordID = word.id
+         selectedWordIDs = []; selectionAnchorID = nil
+
+         DispatchQueue.main.async { self.focusedWordID = word.id }
+    }
+
+    private func commitEdit() {
+        guard let wordIdToCommit = editingWordID else { return }
+        print("[commitEdit] Committing ID \(wordIdToCommit)")
+        defer { editingWordID = nil; editText = "" } // Reset state regardless
+
+        guard let wordIndex = transcriptWords.firstIndex(where: { $0.id == wordIdToCommit }) else { return }
+        let originalText = transcriptWords[wordIndex].text
+        let newText = editText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if originalText != newText && !newText.isEmpty { transcriptWords[wordIndex].text = newText }
+    }
+
+    // MARK: - Helpers
+
+    private func groupWordsIntoLines(words: [TranscriptWord], charactersPerLine: Int) -> [[TranscriptWord]] {
+         var lines: [[TranscriptWord]] = []; var currentLine: [TranscriptWord] = []; var currentLineLength = 0
+         for word in words { let wordLength = word.text.count + 1; if currentLine.isEmpty || currentLineLength + wordLength <= charactersPerLine { currentLine.append(word); currentLineLength += wordLength } else { lines.append(currentLine); currentLine = [word]; currentLineLength = wordLength } }; if !currentLine.isEmpty { lines.append(currentLine) }; return lines
+    }
+
+    private func mergeTranscriptionResults(_ results: [TranscriptionResult]) -> TranscriptionResult? {
+         guard !results.isEmpty else { return nil }; if results.count == 1 { return results.first }
+         let combinedText = results.map { $0.text }.joined(separator: " "); let combinedSegments = results.flatMap { $0.segments }; let language = results.first!.language; var mergedTimings = results.first!.timings; mergedTimings.fullPipeline = results.reduce(TimeInterval(0)) { $0 + $1.timings.fullPipeline }; return TranscriptionResult(text: combinedText, segments: combinedSegments, language: language, timings: mergedTimings)
+    }
+
+} // End ContentView
+
+
+// MARK: - Preview
 #Preview {
     ContentView()
 }
+
+// MARK: - Helper View: WordView
+struct WordView: View {
+    @Binding var word: TranscriptWord
+    @Binding var selectedWordIDs: Set<UUID>
+    @Binding var editingWordID: UUID?
+    @Binding var editText: String
+    @FocusState.Binding var focusedWordID: UUID?
+
+    let onTap: (TranscriptWord) -> Void
+    let onBeginEdit: (TranscriptWord) -> Void
+    let onCommitEdit: () -> Void
+
+    var body: some View {
+        Group {
+            if editingWordID == word.id {
+                TextField("Edit", text: $editText)
+                    .textFieldStyle(.plain)
+                    .font(.system(.body))
+                    .padding(.vertical, 1)
+                    .padding(.horizontal, 2)
+                    .fixedSize()
+                    .focused($focusedWordID, equals: word.id)
+                    .onSubmit(onCommitEdit)
+                    // Removed .onDisappear commit for stability
+                    .onChange(of: focusedWordID) {
+                        if focusedWordID != word.id && editingWordID == word.id {
+                            print("[onChange.Focus] Focus changed away from '\(word.text)'. Committing.")
+                            onCommitEdit()
+                        }
+                    }
+            } else {
+                Text(word.text)
+                    .padding(.vertical, 1)
+                    .padding(.horizontal, 2)
+                    .background(selectedWordIDs.contains(word.id) ? Color.yellow.opacity(0.5) : Color.clear)
+                    .cornerRadius(3)
+                    .onTapGesture(count: 2) { onBeginEdit(word) }
+                    .onTapGesture(count: 1) { onTap(word) }
+            }
+        }
+    }
+} // End WordView
